@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from . import config_loader, database
-from .routers import cancel, chat, folders, knowledge, papers, rules, search, skills
+from .routers import cancel, chat, folders, knowledge, papers, related, rules, search, skills
 from .routers import settings as settings_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -50,6 +50,8 @@ async def lifespan(app: FastAPI):
     logger.info("知识网络 pipeline：%s", " -> ".join(knowledge_steps))
     from knowledge import SEARCH_STAGES as search_stages
     logger.info("检索 pipeline：%s", " -> ".join(search_stages))
+    from knowledge import RELATED_STAGES as related_stages
+    logger.info("关联检索 pipeline：%s", " -> ".join(related_stages))
     yield
 
 
@@ -73,6 +75,7 @@ app.include_router(chat.router)
 app.include_router(skills.router)
 app.include_router(knowledge.router)
 app.include_router(search.router)
+app.include_router(related.router)
 
 
 @app.get("/api/health", tags=["meta"])

@@ -346,7 +346,33 @@ button.mini.primary:hover { color: #fff; filter: brightness(1.05); }
 .viewer-toolbar .mini:hover { background: rgba(255, 255, 255, .22); border-color: rgba(255, 255, 255, .4); color: #fff; }
 .viewer-toolbar .mini.danger:hover { background: var(--danger); border-color: var(--danger); color: #fff; }
 #viewer-body { flex: 1; min-height: 0; display: flex; position: relative; overflow: hidden; }
-#pdf-frame { width: 100%; height: 100%; border: 0; background: #34383f; }
+
+/* ---- PDF 自绘查看器（服务端逐页渲染 + 原生 JS 缩放） ---- */
+#pdf-viewer { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+#pdfv-bar {
+  flex: none; display: flex; align-items: center; gap: 6px;
+  padding: 7px 12px; background: rgba(255, 255, 255, .07);
+  border-bottom: 1px solid rgba(255, 255, 255, .10);
+}
+#pdfv-bar .mini { background: rgba(255, 255, 255, .10); border-color: rgba(255, 255, 255, .2); color: #e7ebf3; }
+#pdfv-bar .mini:hover { background: rgba(255, 255, 255, .22); border-color: rgba(255, 255, 255, .4); color: #fff; }
+#pdfv-bar .mini.on { background: var(--accent); border-color: transparent; color: #fff; }
+#pdfv-bar a.mini { text-decoration: none; display: inline-flex; align-items: center; }
+#pdfv-bar .pdfv-zoom { min-width: 58px; font-variant-numeric: tabular-nums; }
+#pdfv-bar .pdfv-hint { min-width: 52px; text-align: center; font-size: 11.5px; color: #c3c9d6; font-variant-numeric: tabular-nums; }
+#pdfv-scroll { flex: 1; min-height: 0; overflow: auto; padding: 14px 0 26px; cursor: grab; }
+#pdfv-scroll.dragging { cursor: grabbing; }
+#pdfv-pages { --pdfv-zoom: 1; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.pdfv-page {
+  flex: none; width: calc(var(--vw, 612px) * var(--pdfv-zoom));
+  background: #fff; border-radius: 3px; overflow: hidden;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .38);
+}
+.pdfv-page img { display: block; width: 100%; height: 100%; }
+.pdfv-err {
+  height: 100%; display: grid; place-items: center; padding: 24px;
+  color: var(--muted); font-size: 12.5px; text-align: center; line-height: 1.7;
+}
 
 /* ---- 右栏：对话 ---- */
 #chat-pane {
@@ -744,6 +770,10 @@ button.pane-hide { padding: 1px 7px; font-size: 13px; }
 }
 .buffer-item:hover { box-shadow: var(--shadow-sm); transform: translateY(-1px); border-color: var(--border-strong); }
 .b-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+.b-pick { flex: none; display: flex; align-items: center; align-self: flex-start; padding-top: 2px; }
+.b-pick input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; margin: 0; }
+.b-pick.busy { font-size: .9em; opacity: .8; cursor: default; }
+.b-head .b-title { flex: 1; min-width: 0; }
 .b-title { font-weight: 650; color: var(--text); line-height: 1.4; }
 .b-score {
   flex: none; font-size: .78em; padding: 2.5px 9px; border-radius: 999px;
@@ -770,6 +800,19 @@ button.pane-hide { padding: 1px 7px; font-size: 13px; }
 .b-text { font-size: .84em; color: var(--text-soft); line-height: 1.62; white-space: pre-wrap; }
 .b-detail .md { font-size: .87em; }
 .b-detail .md pre { max-height: 260px; }
+
+/* 批量选择条（勾选多篇后一次丢弃） */
+.batch-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border: 1px dashed var(--border-strong); border-radius: var(--radius-sm);
+  background: var(--panel-soft);
+}
+.batch-bar .b-all {
+  display: flex; align-items: center; gap: 6px;
+  font-size: .86em; color: var(--text-soft); font-weight: 600; cursor: pointer;
+}
+.batch-bar .b-all input { accent-color: var(--accent); margin: 0; }
+.batch-bar .hint { flex: 1; margin: 0; font-weight: 500; }
 
 /* ================= 方向节点论文图谱 ================= */
 #graph-view { flex: 1; min-height: 0; overflow: auto; padding: 14px 16px 22px; display: flex; flex-direction: column; gap: 12px; }

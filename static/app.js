@@ -752,15 +752,77 @@
     }).catch(function (e) { toast(e.message, "err"); });
   }
 
+  // 批量选择：bufferItems 是当前渲染条目的快照（批量操作只针对它统计可选集合）；
+  // bufferSelected 是勾选集合（id -> true），重新加载列表时清空。
+  var bufferItems = [];
+  var bufferSelected = {};
+
+  function updateBatchBar() {
+    var bar = $("s-batch-bar");
+    if (!bar) return;
+    var selectable = bufferItems.filter(function (it) { return it.selectable; });
+    var picked = selectable.filter(function (it) { return bufferSelected[it.id]; }).length;
+    bar.classList.toggle("hidden", !selectable.length);
+    var selAll = $("s-select-all");
+    if (selAll) {
+      selAll.disabled = !selectable.length;
+      selAll.checked = selectable.length > 0 && picked === selectable.length;
+      selAll.indeterminate = picked > 0 && picked < selectable.length;
+    }
+    var btn = $("s-batch-reject");
+    if (btn) {
+      btn.disabled = picked === 0;
+      btn.textContent = picked ? "批量丢弃（" + picked + "）" : "批量丢弃";
+    }
+    var hint = $("s-batch-hint");
+    if (hint) hint.textContent = picked ? "已选 " + picked + " 篇" : "勾选论文后可一次丢弃";
+  }
+
+  function toggleSelectAllBuffer(on) {
+    bufferItems.forEach(function (it) {
+      if (!it.selectable) return;
+      if (on) bufferSelected[it.id] = true;
+      else delete bufferSelected[it.id];
+    });
+    document.querySelectorAll("#s-buffer .b-pick input").forEach(function (cb) {
+      var it = bufferItems.filter(function (x) { return x.id === Number(cb.getAttribute("data-id")); })[0];
+      cb.checked = !!(on && it && it.selectable);
+    });
+    updateBatchBar();
+  }
+
+  function rejectSelectedBuffer() {
+    var ids = bufferItems
+      .filter(function (it) { return it.selectable && bufferSelected[it.id]; })
+      .map(function (it) { return it.id; });
+    if (!ids.length) { toast("先勾选要丢弃的论文", "warn"); return; }
+    askConfirm("批量丢弃", [
+      "将丢弃勾选的 " + ids.length + " 篇论文（保留记录，不再参与后续流程）。",
+      "正在「加入详细阅读」的条目会自动跳过。",
+    ], { okText: "丢弃", danger: true }).then(function (ok) {
+      if (!ok) return null;
+      return api.post("/api/buffer/reject-batch", { ids: ids }).then(function (res) {
+        var skipped = (res.skipped_ids || []).length;
+        toast("已丢弃 " + (res.rejected || 0) + " 篇" + (skipped ? "，跳过 " + skipped + " 篇" : ""),
+          res.rejected ? "ok" : "warn");
+        return loadBuffer();
+      }).catch(function (e) { toast(e.message, "err"); });
+    });
+  }
+
   function renderBuffer(items) {
     var box = $("s-buffer"); box.replaceChildren();
+    bufferItems = []; bufferSelected = {};
     if (!items.length) {
       box.appendChild(emptyState("📥", "缓冲区是空的",
         "在上面填好条件点「开始检索」，命中的论文会先落到这里，由你决定是否加入详细阅读。"));
+      updateBatchBar();
       return;
     }
     items.forEach(function (b) {
       var verified = !!b.summary_text;
+      var selectable = !b.promote_state;      // 提升入库中的条目不可批量丢弃
+      bufferItems.push({ id: b.id, selectable: selectable });
       var ops = el("div", { class: "b-ops" }, [
         el("button", { class: "mini", text: "预览", onclick: function () { previewBuffer(b, row); } }),
       ]);
@@ -774,8 +836,23 @@
       ops.appendChild(el("button", { class: "mini primary", text: "加入详细阅读", onclick: function () { promoteBuffer(b, row); } }));
       ops.appendChild(el("button", { class: "mini danger", text: "丢弃", onclick: function () { rejectBuffer(b, row); } }));
 
+      var pickWrap;
+      if (selectable) {
+        var pick = el("input", { type: "checkbox", "data-id": String(b.id) });
+        pick.checked = !!bufferSelected[b.id];
+        pick.addEventListener("change", function () {
+          if (pick.checked) bufferSelected[b.id] = true;
+          else delete bufferSelected[b.id];
+          updateBatchBar();
+        });
+        pickWrap = el("label", { class: "b-pick", title: "勾选后可批量丢弃" }, [pick]);
+      } else {
+        pickWrap = el("span", { class: "b-pick busy", title: "正在加入详细阅读，不可批量丢弃", text: "⏳" });
+      }
+
       var row = el("div", { class: "buffer-item" }, [
         el("div", { class: "b-head" }, [
+          pickWrap,
           el("span", { class: "b-title", text: b.title || b.arxiv_id }),
           el("span", { class: "b-score", text: (b.match_score || 0).toFixed(2) }),
         ]),
@@ -792,6 +869,7 @@
       ]);
       box.appendChild(row);
     });
+    updateBatchBar();
   }
 
   function summarizeBuffer(b, btn) {
@@ -860,6 +938,249 @@
     }).catch(function (e) { toast(e.message, "err"); });
   }
 
+  // ---------------- 智能关联检索（Related Work 关联发现） ----------------
+  // 与 ArXiv 检索页的关系：那是“按检索条件找新论文”；这里是从**当前论文的
+  // Related Work / 参考文献**出发反向找相关论文，判定强相关后可直接加入详细阅读。
+  var relatedPaper = null;
+  var relatedRunId = null;
+  var relatedTimer = null;
+  var relatedPolledRun = null;
+  var relatedPolls = 0;
+  var relatedStages = null;        // 步骤清单从后端读取（不写死中文名，与 STAGE_TITLES 同源）
+  var RELATED_POLL_LIMIT = 900;    // 2s × 900 ≈ 30 分钟硬上限，服务端异常时不无限轮询
+
+  function openRelated(paper) {
+    paper = paper || state.currentPaper;
+    if (!paper) { toast("请先选择一篇论文", "err"); return; }
+    relatedPaper = paper;
+    $("related-head-hint").textContent = "当前论文：《" + shortText(paper.title || paper.arxiv_id, 40) + "》";
+    $("related-modal").classList.remove("hidden");
+    loadRelated();
+    if (relatedRunId) pollRelated(relatedRunId, true);
+  }
+
+  function loadRelated() {
+    if (!relatedPaper) return Promise.resolve();
+    var box = $("r-buffer");
+    if (box && !box.getAttribute("data-ready")) box.replaceChildren(skeleton("rows", 3));
+    return api.get("/api/papers/" + relatedPaper.id + "/related").then(function (data) {
+      box.setAttribute("data-ready", "1");
+      relatedStages = data.stages || [];
+      if (data.run && data.run.id) relatedRunId = data.run.id;
+      renderRelatedRun(data.run);
+      renderRelatedCandidates(data.candidates || [], data.counts || {});
+    }).catch(function (e) { toast(e.message, "err"); });
+  }
+
+  function renderRelatedRun(run) {
+    var stages = relatedStages || [];
+    var logs = (run && run.logs) || [];
+    var effStatus = run ? ((run.status === "running" && run.stage === "done") ? "done" : run.status) : "";
+    var running = effStatus === "running";
+    $("r-progress").classList.toggle("hidden", !run);
+    var box = $("r-stages"); box.replaceChildren();
+    if (run) {
+      stages.forEach(function (s) {
+        var done = logs.some(function (l) { return (l.message || "").indexOf("[" + s.title + "] done") === 0; });
+        var isRunning = !done && s.name === (run.stage || "") && running;
+        box.appendChild(el("div", { class: "stage " + (done ? "done" : (isRunning ? "running" : "todo")) }, [
+          el("span", { class: "dot", text: done ? "✓" : (isRunning ? "◐" : "○") }),
+          el("span", { class: "st", text: s.title }),
+          el("span", { class: "sd", text: stageDetail(logs, s.title) }),
+        ]));
+      });
+      box.appendChild(el("div", { class: "stage " + (effStatus === "done" ? "done" : (running ? "running" : "failed")) }, [
+        el("span", { class: "dot", text: effStatus === "done" ? "✓" : (running ? "◐" : "■") }),
+        el("span", { class: "st", text: "任务：" + (RUN_STATE[effStatus] || effStatus)
+          + (run.cancel_requested && running ? "（已请求中断，当前阶段结束后停止）" : "") }),
+      ]));
+    }
+
+    var c = (run && run.counters) || {};
+    $("r-bar").style.width = (effStatus === "done" ? 100
+      : Math.min(96, Math.round(100 * ((c.summarized || 0) + (c.strong || 0) + (c.weak || 0))
+          / Math.max(1, 2 * (c.selected || 1))))) + "%";
+    $("r-counters").textContent = run ? ("种子 " + (c.seeds || 0) + " · 命中 " + (c.found || 0)
+      + " · 去重跳过 " + (c.duplicated || 0) + " · 候选 " + (c.selected || 0)
+      + " · 已总结 " + (c.summarized || 0) + " · 强相关 " + (c.strong || 0)
+      + " · 弱相关 " + (c.weak || 0) + (run.error ? " · 错误：" + run.error : "")) : "";
+
+    var html = logs.slice(-60).map(function (l) {
+      return '<div class="log ' + escapeHtml(l.level || "info") + '"><span class="lt">'
+        + escapeHtml(l.ts || "") + "</span> " + escapeHtml(l.message || "") + "</div>";
+    }).join("");
+    var logBox = $("r-logs");
+    if (logBox.getAttribute("data-last") !== html) {
+      logBox.innerHTML = html; logBox.scrollTop = logBox.scrollHeight; logBox.setAttribute("data-last", html);
+    }
+    $("r-run").disabled = running;
+    $("r-cancel").classList.toggle("hidden", !running);
+  }
+
+  function renderRelatedCandidates(items, counts) {
+    $("r-counts").textContent = "待处理 " + (counts.pending || 0) + " · 已入库 "
+      + (counts.promoted || 0) + " · 弱相关丢弃 " + (counts.discarded || 0);
+    var box = $("r-buffer"); box.replaceChildren();
+    if (!items.length) {
+      box.appendChild(emptyState("🧲", "还没有强相关候选",
+        "点「开始智能关联检索」：会读当前论文的 Related Work 与 References，检索后仅保留强相关论文。"));
+      return;
+    }
+    items.forEach(function (c) {
+      var promoted = c.status === "promoted" || c.promote_state === "done";
+      var ops = el("div", { class: "b-ops" }, [
+        el("button", { class: "mini", text: "预览", onclick: function () { previewRelated(c, row); } }),
+      ]);
+      if (c.in_library && c.promoted_paper_id) {
+        ops.appendChild(el("button", { class: "mini", text: "打开",
+          onclick: function () { openPaperById(c.promoted_paper_id); } }));
+      }
+      if (!promoted) {
+        ops.appendChild(el("button", { class: "mini primary", text: "加入详细阅读",
+          onclick: function () { promoteRelated(c, row); } }));
+      }
+      ops.appendChild(el("button", { class: "mini danger", text: "丢弃",
+        onclick: function () { discardRelated(c, row); } }));
+
+      var badges = el("div", { class: "b-badges" }, [
+        el("span", { class: "b-chip ok", text: "✓ 强相关 " + (c.relevance_score || 0).toFixed(2) }),
+        el("span", { class: "b-chip", text: "标题匹配 " + (c.match_score || 0).toFixed(2) }),
+      ]);
+      if (c.in_library) badges.appendChild(el("span", { class: "b-chip path", text: "📚 已在库" }));
+      else if (c.in_buffer) badges.appendChild(el("span", { class: "b-chip warn", text: "📥 已在待读缓冲区" }));
+      if (promoted) badges.appendChild(el("span", { class: "b-chip ok", text: "✓ 已加入详细阅读" }));
+      if (c.promote_state === "running" || c.promote_state === "queued") {
+        badges.appendChild(el("span", { class: "b-chip warn", text: "⏳ 处理中" }));
+      }
+
+      var row = el("div", { class: "buffer-item" }, [
+        el("div", { class: "b-head" }, [
+          el("span", { class: "b-title", text: c.title || c.arxiv_id }),
+          el("span", { class: "b-score", text: (c.relevance_score || 0).toFixed(2) }),
+        ]),
+        el("div", { class: "b-meta", text: [(c.authors || []).slice(0, 3).join(", "),
+          (c.published || "").slice(0, 10), c.arxiv_id].filter(Boolean).join(" · ") }),
+        badges,
+        el("div", { class: "b-reason", text: c.relevance_reason || "" }),
+        ops,
+        el("div", { class: "b-detail hidden" }),
+      ]);
+      box.appendChild(row);
+    });
+  }
+
+  function previewRelated(c, row) {
+    var detail = row.querySelector(".b-detail");
+    if (!detail.classList.contains("hidden")) { detail.classList.add("hidden"); return; }
+    detail.replaceChildren();
+    detail.appendChild(el("div", { class: "b-sec", text: "检索种子（来自 Related Work / References）" }));
+    detail.appendChild(el("div", { class: "b-text", text: c.seed_title || "—" }));
+    detail.appendChild(el("div", { class: "b-sec", text: "相关性判定理由" }));
+    detail.appendChild(el("div", { class: "b-text", text: c.relevance_reason || "—" }));
+    detail.appendChild(el("div", { class: "b-sec",
+      text: "快速总结（加入详细阅读时复用，不重复生成）" }));
+    var md = el("div", { class: "md" });
+    setMd(md, c.summary_text || "（未生成）");
+    detail.appendChild(md);
+    detail.appendChild(el("div", { class: "b-sec", text: "摘要" }));
+    detail.appendChild(el("div", { class: "b-text", text: c.abstract || "（无）" }));
+    detail.classList.remove("hidden");
+  }
+
+  function startRelated() {
+    if (!relatedPaper) return;
+    relatedPolls = 0;
+    relatedPolledRun = null;
+    $("r-run").disabled = true;
+    $("r-cancel").classList.remove("hidden");
+    $("r-progress").classList.remove("hidden");
+    $("r-logs").replaceChildren(el("div", { class: "log info", text: "已提交，等待读取 Related Work 与 References…" }));
+    api.post("/api/papers/" + relatedPaper.id + "/related/run", {}).then(function (run) {
+      relatedRunId = run.id;
+      renderRelatedRun(run);
+      pollRelated(run.id, false);
+    }).catch(function (e) {
+      toast(e.message, "err");
+      $("r-run").disabled = false;
+      $("r-cancel").classList.add("hidden");
+    });
+  }
+
+  function pollRelated(runId, silent) {
+    clearTimeout(relatedTimer);
+    if (relatedPolledRun !== runId) { relatedPolledRun = runId; relatedPolls = 0; }
+    api.get("/api/papers/" + relatedPaper.id + "/related").then(function (data) {
+      var run = data.run || null;
+      renderRelatedRun(run);
+      renderRelatedCandidates(data.candidates || [], data.counts || {});
+      relatedPolls += 1;
+      // stage 已 done 的 run 就算 status 还写着 running 也不再轮询（兼容历史数据）
+      var running = run && run.status === "running" && run.stage !== "done";
+      if (running && relatedPolls < RELATED_POLL_LIMIT) {
+        relatedTimer = setTimeout(function () { pollRelated(runId, silent); }, 2000);
+        return;
+      }
+      $("r-run").disabled = false;
+      $("r-cancel").classList.add("hidden");
+      if (running) {
+        toast("关联检索已超过 30 分钟，界面停止轮询（任务仍在后台跑，可重新打开此页查看）", "warn", 8000);
+        return;
+      }
+      if (!silent && run) {
+        var effStatus = (run.status === "running" && run.stage === "done") ? "done" : run.status;
+        toast("关联检索" + (effStatus === "done" ? "完成" : (effStatus === "failed" ? "失败" : "已停止"))
+          + "：强相关 " + ((run.counters || {}).strong || 0) + " 篇"
+          + (run.error ? "（" + run.error + "）" : ""),
+          effStatus === "done" ? "ok" : (effStatus === "failed" ? "err" : "warn"), 6000);
+      }
+    }).catch(function (e) { if (!silent) toast(e.message, "err"); });
+  }
+
+  function cancelRelated() {
+    if (!relatedPaper) return;
+    api.post("/api/papers/" + relatedPaper.id + "/related/cancel", {}).then(function () {
+      toast("已请求中断：当前阶段结束后停止，已判定结果保留", "info");
+    }).catch(function (e) { toast(e.message, "err"); });
+  }
+
+  function promoteRelated(c, row) {
+    askConfirm("加入详细阅读", [
+      "《" + shortText(c.title || c.arxiv_id, 46) + "》",
+      "会下载全文入库，并跳过快速总结（复用候选总结），继续：方向树归属 → 深度精读 → 局部图谱 → 阶段综述。",
+      "处理在后台进行，可关闭窗口；导入后可到左侧方向文件夹里查看。",
+    ], { okText: "开始处理" }).then(function (ok) {
+      if (!ok) return null;
+      var badge = el("span", { class: "b-state", text: "排队中…" });
+      row.querySelector(".b-ops").appendChild(badge);
+      return api.post("/api/related/candidates/" + c.id + "/promote?background=true&trigger_pipeline=true", {}).then(function () {
+        var timer = setInterval(function () {
+          api.get("/api/related/candidates/" + c.id).then(function (full) {
+            if (full.promote_state === "running" || full.promote_state === "queued") {
+              badge.textContent = full.promote_state === "running" ? "处理中（下载/入库/精读/图谱）…" : "排队中…";
+              return;
+            }
+            clearInterval(timer);
+            if (full.promote_state === "done") {
+              badge.textContent = "已入库 ✓";
+              if (full.promote_error) toast("已加入详细阅读；" + full.promote_error, "warn", 9000);
+              else toast("已加入详细阅读，并完成知识网络流程", "ok");
+              loadFolders(); loadPapers(); loadRelated();
+            } else {
+              badge.textContent = "失败";
+              toast("加入详细阅读失败：" + (full.promote_error || "未知错误"), "err", 9000);
+            }
+          }).catch(function () { /* 轮询失败就下次再试 */ });
+        }, 3000);
+      }).catch(function (e) { badge.remove(); toast(e.message, "err"); });
+    });
+  }
+
+  function discardRelated(c, row) {
+    api.post("/api/related/candidates/" + c.id + "/discard", {}).then(function () {
+      row.remove(); loadRelated(); toast("已丢弃该候选", "info");
+    }).catch(function (e) { toast(e.message, "err"); });
+  }
+
   // ---------------- 方向节点论文图谱（md + 无依赖 SVG） ----------------
   var currentGraphNodeId = null;
   var REL_LABEL = { cites: "引用", extends: "扩展", improves: "改进", contradicts: "对立",
@@ -867,7 +1188,7 @@
 
   function showNodeGraph(nodeId) {
     currentGraphNodeId = nodeId;
-    $("pdf-frame").classList.add("hidden");
+    hidePdfViewer();
     $("viewer-empty").classList.add("hidden");
     $("viewer-toolbar").classList.add("hidden");
     $("graph-view").classList.remove("hidden");
@@ -878,11 +1199,11 @@
     currentGraphNodeId = null;
     $("graph-view").classList.add("hidden");
     // 关掉图谱后既没有图谱也没有 PDF 时，把空态露出来（否则预览区留白）
-    if ($("pdf-frame").classList.contains("hidden")) $("viewer-empty").classList.remove("hidden");
+    if (!pdfvVisible()) $("viewer-empty").classList.remove("hidden");
   }
 
   function showViewerEmpty() {
-    $("pdf-frame").classList.add("hidden");
+    hidePdfViewer();
     $("viewer-toolbar").classList.add("hidden");
     $("graph-view").classList.add("hidden");
     $("viewer-empty").classList.remove("hidden");
@@ -899,7 +1220,7 @@
     $("graph-svg-box").replaceChildren(skeleton("graph", 2));
     $("graph-papers").replaceChildren();
     $("graph-legend").classList.add("hidden");
-    $("pdf-frame").classList.add("hidden");
+    hidePdfViewer();
     $("viewer-empty").classList.add("hidden");
     $("viewer-toolbar").classList.add("hidden");
     $("graph-view").classList.remove("hidden");
@@ -1386,6 +1707,214 @@
     });
   }
 
+  // ---------------- PDF 查看器（服务端逐页渲染 + 原生 JS 缩放） ----------------
+  // 为什么不用浏览器内置 <iframe> viewer：它跑在跨源上下文里，外部无法控制缩放；
+  // 项目约定前端零第三方依赖（不引 CDN 版 PDF.js），因此改为服务端 PyMuPDF 把每页
+  // 渲染成 PNG，前端自绘可缩放查看器：
+  //   滚轮向上放大 / 向下缩小（默认），触控板捏合（ctrl+wheel）缩放，按住拖动平移；
+  //   工具栏可把滚轮切换为“滚动”（此时捏合与 Ctrl+滚轮仍缩放）。
+  var PDFV_PT_TO_PX = 96 / 72;             // PDF point -> CSS px（zoom=1 即实际尺寸）
+  var PDFV_MIN_REL = 0.5;                  // 相对“适应宽度”的最小缩放
+  var PDFV_MAX_REL = 6.0;
+  var pdfView = {
+    paperId: null, pages: [], zoom: 1, fitZoom: 1, basePx: 0, wheelZoom: true,
+    anchorY: null, pendingFactor: 1, rafPending: false,
+  };
+
+  function pdfvVisible() { return !$("pdf-viewer").classList.contains("hidden"); }
+
+  function showPdfViewer(paper) {
+    pdfView.paperId = paper.id;
+    pdfView.pages = [];
+    pdfView.zoom = 1;
+    pdfView.fitZoom = 1;
+    pdfView.pendingFactor = 1;
+    $("pdfv-native").setAttribute("href", "/api/papers/" + paper.id + "/pdf");
+    $("pdf-viewer").classList.remove("hidden");
+    $("viewer-empty").classList.add("hidden");
+    var pagesBox = $("pdfv-pages");
+    pagesBox.replaceChildren(skeleton("cards", 3));
+    $("pdfv-pageno").textContent = "…";
+    api.get("/api/papers/" + paper.id + "/pages").then(function (data) {
+      if (pdfView.paperId !== paper.id) return;      // 加载期间用户已切走
+      pdfView.pages = data.pages || [];
+      buildPdfPages();
+      fitPdfWidth(false);
+    }).catch(function (e) {
+      if (pdfView.paperId !== paper.id) return;
+      pagesBox.replaceChildren(emptyState("📄", "无法加载 PDF", e.message));
+      $("pdfv-pageno").textContent = "";
+    });
+  }
+
+  function hidePdfViewer() { $("pdf-viewer").classList.add("hidden"); }
+
+  function buildPdfPages() {
+    var box = $("pdfv-pages");
+    box.replaceChildren();
+    var maxW = 612;
+    pdfView.pages.forEach(function (p) { maxW = Math.max(maxW, p.width || 612); });
+    pdfView.basePx = maxW * PDFV_PT_TO_PX;
+    pdfView.pages.forEach(function (p) {
+      var widthPt = p.width || 612, heightPt = p.height || 792;
+      var wpx = Math.round(widthPt * PDFV_PT_TO_PX);
+      var wrapEl = el("div", {
+        class: "pdfv-page", "data-page": String(p.page),
+        style: "--vw: " + wpx + "px; aspect-ratio: " + widthPt + " / " + heightPt,
+      });
+      var img = el("img", {
+        src: "/api/papers/" + pdfView.paperId + "/page/" + p.page + "?scale=2",
+        alt: "第 " + p.page + " 页", loading: "lazy", draggable: "false",
+      });
+      img.addEventListener("error", function () {
+        img.remove();
+        wrapEl.appendChild(el("div", { class: "pdfv-err",
+          text: "第 " + p.page + " 页加载失败（可点「↗ 原生」打开查看）" }));
+      });
+      wrapEl.appendChild(img);
+      box.appendChild(wrapEl);
+    });
+    box.style.setProperty("--pdfv-zoom", String(pdfView.zoom));
+    updatePdfZoomLabel();
+    updatePdfPageLabel();
+  }
+
+  function pdfvContentHeight() { return $("pdfv-pages").getBoundingClientRect().height; }
+
+  function clampPdfZoom(zoom) {
+    var min = pdfView.fitZoom * PDFV_MIN_REL;
+    var max = Math.max(pdfView.fitZoom * PDFV_MAX_REL, 3);
+    return Math.max(min, Math.min(max, zoom));
+  }
+
+  /** 缩放并保持锚点处的内容位置不变（滚轮向上放大 / 向下缩小都走这里）。 */
+  function applyPdfZoom(factor, anchorY) {
+    if (!pdfView.pages.length) return;
+    var scroll = $("pdfv-scroll");
+    var oldZoom = pdfView.zoom;
+    var newZoom = clampPdfZoom(oldZoom * factor);
+    if (Math.abs(newZoom - oldZoom) < 1e-4) return;
+    var ay = (anchorY === null || anchorY === undefined) ? scroll.clientHeight / 2 : anchorY;
+    var oldRatio = (scroll.scrollTop + ay) / Math.max(1, pdfvContentHeight());
+    pdfView.zoom = newZoom;
+    $("pdfv-pages").style.setProperty("--pdfv-zoom", String(newZoom));
+    scroll.scrollTop = Math.max(0, oldRatio * Math.max(1, pdfvContentHeight()) - ay);
+    updatePdfZoomLabel();
+  }
+
+  function fitPdfWidth(scrollToTop) {
+    var scroll = $("pdfv-scroll");
+    if (!pdfView.basePx || !scroll.clientWidth) return;
+    var avail = Math.max(120, scroll.clientWidth - 26);
+    pdfView.fitZoom = Math.max(0.1, Math.min(5, avail / pdfView.basePx));
+    pdfView.zoom = pdfView.fitZoom;
+    $("pdfv-pages").style.setProperty("--pdfv-zoom", String(pdfView.zoom));
+    if (scrollToTop) scroll.scrollTop = 0;
+    updatePdfZoomLabel();
+    updatePdfPageLabel();
+  }
+
+  function updatePdfZoomLabel() {
+    var label = $("pdfv-label");
+    if (label) label.textContent = Math.round(pdfView.zoom * 100) + "%";
+  }
+
+  function updatePdfPageLabel() {
+    var box = $("pdfv-pageno");
+    if (!box) return;
+    var total = pdfView.pages.length;
+    if (!total) { box.textContent = ""; return; }
+    var scroll = $("pdfv-scroll");
+    var pages = scroll.querySelectorAll(".pdfv-page");
+    var viewTop = scroll.getBoundingClientRect().top;
+    var current = 1;
+    for (var i = 0; i < pages.length; i++) {
+      var rect = pages[i].getBoundingClientRect();
+      if (rect.top - viewTop <= scroll.clientHeight * 0.45) current = i + 1;
+      else break;
+    }
+    box.textContent = current + " / " + total;
+  }
+
+  // 滚轮 / 触控板捏合：ctrl+wheel 是浏览器对捏合的标准化事件；
+  // 默认模式下普通滚轮也缩放（需求：向上放大、向下缩小），可在工具栏切回滚动。
+  function onPdfvWheel(e) {
+    if (!pdfvVisible()) return;
+    var zoomIntent = e.ctrlKey || pdfView.wheelZoom;
+    if (!zoomIntent) return;                 // 滚动模式：交还浏览器默认滚动
+    e.preventDefault();
+    var rect = $("pdfv-scroll").getBoundingClientRect();
+    pdfView.anchorY = e.clientY - rect.top;
+    pdfView.pendingFactor *= Math.pow(1.0016, -e.deltaY);
+    if (pdfView.rafPending) return;
+    pdfView.rafPending = true;
+    requestAnimationFrame(function () {
+      pdfView.rafPending = false;
+      var factor = pdfView.pendingFactor;
+      pdfView.pendingFactor = 1;
+      applyPdfZoom(factor, pdfView.anchorY);
+    });
+  }
+
+  var pdfvScrollTimer = null;
+  function onPdfvScroll() {
+    if (pdfvScrollTimer) return;
+    pdfvScrollTimer = setTimeout(function () {
+      pdfvScrollTimer = null;
+      updatePdfPageLabel();
+    }, 120);
+  }
+
+  // 按住拖动平移（滚轮被绑为缩放后，拖拽是主要的快速翻阅方式）
+  var pdfvDrag = null;
+  function beginPdfvDrag(e) {
+    if (e.button !== 0 || !pdfvVisible()) return;
+    var scroll = $("pdfv-scroll");
+    pdfvDrag = { x: e.clientX, y: e.clientY, left: scroll.scrollLeft, top: scroll.scrollTop };
+    scroll.classList.add("dragging");
+    window.addEventListener("pointermove", movePdfvDrag);
+    window.addEventListener("pointerup", endPdfvDrag);
+    e.preventDefault();
+  }
+  function movePdfvDrag(e) {
+    if (!pdfvDrag) return;
+    var scroll = $("pdfv-scroll");
+    scroll.scrollLeft = pdfvDrag.left - (e.clientX - pdfvDrag.x);
+    scroll.scrollTop = pdfvDrag.top - (e.clientY - pdfvDrag.y);
+  }
+  function endPdfvDrag() {
+    if (!pdfvDrag) return;
+    pdfvDrag = null;
+    $("pdfv-scroll").classList.remove("dragging");
+    window.removeEventListener("pointermove", movePdfvDrag);
+    window.removeEventListener("pointerup", endPdfvDrag);
+  }
+
+  function togglePdfvWheel() {
+    pdfView.wheelZoom = !pdfView.wheelZoom;
+    var btn = $("pdfv-wheel");
+    btn.classList.toggle("on", pdfView.wheelZoom);
+    btn.textContent = pdfView.wheelZoom ? "🖱 滚轮: 缩放" : "🖱 滚轮: 滚动";
+    toast(pdfView.wheelZoom
+      ? "滚轮 = 缩放（向上放大 / 向下缩小）；触控板捏合同样缩放，按住拖动可平移"
+      : "滚轮 = 滚动；触控板捏合与 Ctrl+滚轮仍可缩放", "info", 4200);
+  }
+
+  function initPdfvEvents() {
+    var scroll = $("pdfv-scroll");
+    if (!scroll) return;
+    scroll.addEventListener("wheel", onPdfvWheel, { passive: false });
+    scroll.addEventListener("scroll", onPdfvScroll);
+    scroll.addEventListener("pointerdown", beginPdfvDrag);
+    if (typeof ResizeObserver !== "undefined") {
+      // 栏宽拖拽不触发 window.resize：处于“适应宽度”时跟随容器宽度重新适配
+      new ResizeObserver(function () {
+        if (!pdfvVisible() || !pdfView.basePx) return;
+        if (Math.abs(pdfView.zoom - pdfView.fitZoom) < 0.002) fitPdfWidth(false);
+      }).observe(scroll);
+    }
+  }
+
   // ---------------- 论文列表 ----------------
   function loadPapers() {
     var qs = [];
@@ -1440,9 +1969,7 @@
   function selectPaper(p) {
     hideNodeGraph();
     state.currentPaper = p; renderPapers();
-    $("viewer-empty").classList.add("hidden");
-    var frame = $("pdf-frame"); frame.classList.remove("hidden");
-    frame.src = "/api/papers/" + p.id + "/pdf";
+    showPdfViewer(p);
     $("viewer-toolbar").classList.remove("hidden");
     $("viewer-title").textContent = p.title || p.arxiv_id;
     $("chat-title").textContent = p.title || p.arxiv_id;
@@ -1527,7 +2054,9 @@
   function clearCurrentPaper() {
     state.currentPaper = null; state.sessions = []; state.currentSessionId = null;
     state.artifacts = {};
-    $("pdf-frame").classList.add("hidden"); $("pdf-frame").removeAttribute("src");
+    hidePdfViewer();
+    $("pdfv-pages").replaceChildren();
+    pdfView.paperId = null; pdfView.pages = [];
     $("viewer-empty").classList.remove("hidden");
     $("viewer-toolbar").classList.add("hidden");
     $("chat-title").textContent = "未选择论文";
@@ -2005,6 +2534,14 @@
     $("reextract-paper").addEventListener("click", reextractPaper);
     $("move-confirm").addEventListener("click", confirmMove);
 
+    // PDF 查看器：缩放按钮 / 滚轮与拖拽监听
+    if ($("pdfv-in")) $("pdfv-in").addEventListener("click", function () { applyPdfZoom(1.25, null); });
+    if ($("pdfv-out")) $("pdfv-out").addEventListener("click", function () { applyPdfZoom(1 / 1.25, null); });
+    if ($("pdfv-fit")) $("pdfv-fit").addEventListener("click", function () { fitPdfWidth(false); });
+    if ($("pdfv-label")) $("pdfv-label").addEventListener("click", function () { fitPdfWidth(false); });
+    if ($("pdfv-wheel")) $("pdfv-wheel").addEventListener("click", togglePdfvWheel);
+    initPdfvEvents();
+
     // 布局：顶栏切换按钮 + 各面板隐藏按钮 + 拖拽分隔条
     document.querySelectorAll(".layout-toggles .lt").forEach(function (b) {
       b.addEventListener("click", function () { togglePane(b.getAttribute("data-pane")); });
@@ -2070,6 +2607,15 @@
     if ($("open-search")) $("open-search").addEventListener("click", openSearch);
     if ($("s-run")) $("s-run").addEventListener("click", startSearch);
     if ($("s-cancel")) $("s-cancel").addEventListener("click", cancelSearch);
+    if ($("s-select-all")) $("s-select-all").addEventListener("change", function () {
+      toggleSelectAllBuffer($("s-select-all").checked);
+    });
+    if ($("s-batch-reject")) $("s-batch-reject").addEventListener("click", rejectSelectedBuffer);
+
+    // 智能关联检索（预览工具栏入口 + 弹窗内操作）
+    if ($("run-related")) $("run-related").addEventListener("click", function () { openRelated(state.currentPaper); });
+    if ($("r-run")) $("r-run").addEventListener("click", startRelated);
+    if ($("r-cancel")) $("r-cancel").addEventListener("click", cancelRelated);
     if ($("graph-refresh")) $("graph-refresh").addEventListener("click", function () {
       if (currentGraphNodeId) loadNodeGraph(currentGraphNodeId);
     });

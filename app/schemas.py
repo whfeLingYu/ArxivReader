@@ -293,10 +293,94 @@ class BufferListOut(BaseModel):
     counts: Dict[str, int] = {}
 
 
+class BufferBatchRejectRequest(BaseModel):
+    """批量丢弃：一次提交多个缓冲区条目 id。"""
+
+    ids: List[int] = Field(..., min_length=1, max_length=500)
+
+
+class BufferBatchRejectOut(BaseModel):
+    """批量丢弃结果：skipped 包含不存在的 id 与提升中的 id。"""
+
+    rejected: int = 0
+    rejected_ids: List[int] = []
+    skipped_ids: List[int] = []
+    counts: Dict[str, int] = {}
+
+
 class PromoteOut(BaseModel):
     """提升入库（加入详细阅读）：后台执行时只看 promote_state 轮询。"""
 
     buffer_id: int
+    promote_state: str
+    paper_id: Optional[int] = None
+    pipeline: Optional[Dict[str, Any]] = None
+
+
+# ---------------- 智能关联检索（Related Work） ----------------
+class RelatedRunOut(BaseModel):
+    """关联检索 run 状态（轮询用）：阶段 / 计数 / 实时日志。"""
+
+    id: int
+    paper_id: int = 0
+    status: str
+    stage: str = ""
+    counters: Dict[str, Any] = {}
+    error: str = ""
+    cancel_requested: bool = False
+    started_at: Optional[datetime.datetime] = None
+    finished_at: Optional[datetime.datetime] = None
+    logs: List[Dict[str, Any]] = []
+    log_total: int = 0
+
+
+class RelatedStageOut(BaseModel):
+    """关联检索步骤（名称与标题由后端提供，前端不写死中文名）。"""
+
+    name: str
+    title: str
+
+
+class RelatedCandidateOut(BaseModel):
+    """候选论文：强相关（pending/promoted）才会出现在视图列表里。"""
+
+    id: int
+    arxiv_id: str
+    title: str
+    abstract: str = ""
+    authors: List[str] = []
+    categories: List[str] = []
+    published: Optional[str] = None
+    seed_title: str = ""
+    match_score: float = 0.0
+    summary_text: str = ""
+    relevance: str = ""
+    relevance_score: float = 0.0
+    relevance_reason: str = ""
+    status: str = "pending"
+    promote_state: str = ""
+    promote_error: str = ""
+    promoted_paper_id: Optional[int] = None
+    in_library: bool = False
+    in_buffer: bool = False
+    created_at: Optional[datetime.datetime] = None
+    updated_at: Optional[datetime.datetime] = None
+
+
+class RelatedViewOut(BaseModel):
+    """关联检索视图：步骤清单 + 最新 run + 强相关候选 + 计数。"""
+
+    paper_id: int
+    stages: List[RelatedStageOut] = []
+    run: Optional[RelatedRunOut] = None
+    candidates: List[RelatedCandidateOut] = []
+    counts: Dict[str, int] = {}
+
+
+class RelatedPromoteOut(BaseModel):
+    """候选「加入详细阅读」：后台执行时用 promote_state 轮询。"""
+
+    candidate_id: int
     promote_state: str
     paper_id: Optional[int] = None
     pipeline: Optional[Dict[str, Any]] = None

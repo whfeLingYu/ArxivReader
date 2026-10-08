@@ -65,6 +65,7 @@
           <span id="viewer-title" class="v-title"></span>
           <span class="v-ops">
             <button id="run-pipeline" class="mini" title="对这篇论文跑知识网络：快速总结 → 方向树归属 → 深度精读 → 局部图谱 → 阶段综述（产物在右栏页签里查看）">🧠 知识网络</button>
+            <button id="run-related" class="mini" title="智能关联检索：读当前论文的 Related Work / 参考文献，自动到 arXiv 检索并筛选强相关论文（可一键加入详细阅读）">🔗 智能关联检索</button>
             <button id="move-paper" class="mini" title="移动到其它文件夹">📁 移动</button>
             <button id="reextract-paper" class="mini" title="重新抽取 PDF 全文">↻ 重抽全文</button>
             <button id="delete-paper" class="mini danger" title="从库中删除">🗑 删除</button>
@@ -77,7 +78,21 @@
             <div class="t">选一篇论文开始阅读</div>
             <div class="h">左侧列表点击论文即可预览 PDF 并就其提问；点击带 🧭 的方向文件夹，查看该方向的论文图谱。</div>
           </div>
-          <iframe id="pdf-frame" class="hidden" title="PDF 预览"></iframe>
+          <!-- PDF 自绘查看器：服务端逐页渲染图片 + 原生 JS 缩放（滚轮 / 触控板捏合）。
+               不再用浏览器内置 iframe viewer：它无法从外部控制缩放，而项目约定前端零第三方依赖。 -->
+          <div id="pdf-viewer" class="hidden">
+            <div id="pdfv-bar">
+              <button id="pdfv-out" class="mini" title="缩小（鼠标滚轮向下 / 触控板捏合）">−</button>
+              <button id="pdfv-label" class="mini pdfv-zoom" title="当前缩放（100% = 实际尺寸）；点击重置为适应宽度">100%</button>
+              <button id="pdfv-in" class="mini" title="放大（鼠标滚轮向上 / 触控板捏合）">＋</button>
+              <button id="pdfv-fit" class="mini" title="缩放至适应预览栏宽度">适应宽度</button>
+              <span class="pdfv-hint" id="pdfv-pageno">1 / 1</span>
+              <span class="spacer"></span>
+              <button id="pdfv-wheel" class="mini on" title="切换滚轮行为：缩放（默认）/ 滚动；触控板捏合始终缩放">🖱 滚轮: 缩放</button>
+              <a id="pdfv-native" class="mini" href="#" target="_blank" rel="noopener noreferrer" title="用浏览器内置阅读器打开（支持文本选择 / 搜索 / 打印）">↗ 原生</a>
+            </div>
+            <div id="pdfv-scroll"><div id="pdfv-pages"></div></div>
+          </div>
           <div id="graph-view" class="hidden">
             <div id="graph-head">
               <span id="graph-path" class="g-path"></span>
@@ -122,7 +137,7 @@
       <div id="artifact-tabs" class="artifact-tabs">
         <button class="art-tab active" data-view="chat" title="与论文对话">💬 对话</button>
         <button class="art-tab" data-view="summary" title="快速总结：洞察、贡献、结论（含“解决了什么 / 未来展望”）">🧾 快速总结<span class="art-meta"></span></button>
-        <button class="art-tab" data-view="deep_reading" title="深度精读：动机、方法、实验、局限、可复现要点">📖 深度精读<span class="art-meta"></span></button>
+        <button class="art-tab" data-view="deep_reading" title="深度精读：论文背景、详细方法、详细实验、Insight 与价值、不足与未来展望">📖 深度精读<span class="art-meta"></span></button>
       </div>
 
       <div id="artifact-view" class="artifact-view hidden">
@@ -263,6 +278,11 @@
             <span>匹配论文（待读缓冲区）</span>
             <span class="hint" id="s-buffer-counts"></span>
           </div>
+          <div id="s-batch-bar" class="batch-bar hidden">
+            <label class="b-all" title="全选 / 取消全选本页可选论文"><input type="checkbox" id="s-select-all" /> 全选</label>
+            <button id="s-batch-reject" class="mini danger" disabled>批量丢弃</button>
+            <span class="hint" id="s-batch-hint">勾选论文后可一次丢弃</span>
+          </div>
           <div id="s-buffer"></div>
         </div>
       </div>
@@ -277,6 +297,42 @@
   </div>
 
   <div id="ctx-menu" class="ctx-menu hidden"></div>
+
+  <!-- 智能关联检索（Related Work -> 候选论文 -> 加入详细阅读） -->
+  <div id="related-modal" class="modal hidden">
+    <div class="modal-card search-wide">
+      <div class="modal-head">
+        <span>智能关联检索 · Related Work 关联发现</span>
+        <span class="head-hint" id="related-head-hint"></span>
+        <button class="mini" data-close="related-modal">✕</button>
+      </div>
+      <div class="modal-body search-body">
+        <div class="search-left">
+          <div class="hint" id="related-intro">从当前论文的 Related Work 与 References 提取关键论文标题，到 arXiv 检索并逐篇快速总结，再由模型判定相关性：强相关保留（可加入详细阅读），弱相关自动丢弃。</div>
+          <div id="r-progress" class="hidden">
+            <div class="stage-row" id="r-stages"></div>
+            <div class="progress"><div id="r-bar" class="progress-bar"></div></div>
+            <div class="hint" id="r-counters"></div>
+            <div id="r-logs" class="search-logs"></div>
+          </div>
+        </div>
+        <div class="search-results">
+          <div class="results-head">
+            <span>强相关论文（可加入详细阅读）</span>
+            <span class="hint" id="r-counts"></span>
+          </div>
+          <div id="r-buffer"></div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button id="r-run" class="primary">开始智能关联检索</button>
+        <button id="r-cancel" class="ghost hidden">中断检索</button>
+        <span class="hint foot-hint">「加入详细阅读」跳过快速总结（复用候选总结），继续：方向树归属 → 深度精读 → 局部图谱 → 阶段综述</span>
+        <span class="spacer"></span>
+        <button class="ghost" data-close="related-modal">关闭</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 通用确认 / 输入弹窗（替代原生 prompt / confirm：沙箱环境会禁用原生弹窗） -->
   <div id="dialog-modal" class="modal hidden">

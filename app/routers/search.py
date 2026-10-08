@@ -8,6 +8,7 @@
   GET  /api/search/runs             历史检索记录
 
   GET  /api/buffer                  待读缓冲区列表（含各状态计数）
+  POST /api/buffer/reject-batch     批量丢弃（一次勾选多篇时用）
   GET  /api/buffer/{id}             单条详情（title + abstract + 预筛理由 + 快速总结 + 建议路径）
   POST /api/buffer/{id}/summarize   对某条按需补跑「快速总结 + 归属复核」（预览用）
   POST /api/buffer/{id}/promote     加入详细阅读：迁入正式库 + 触发单篇 pipeline（默认后台）
@@ -109,6 +110,14 @@ def list_buffer(status: str = Query("pending", description="pending/read/rejecte
 @router.get("/buffer/{buffer_id}", response_model=schemas.BufferPaperOut)
 def get_buffer(buffer_id: int, db: Session = Depends(database.get_db)):
     return _buffer_or_404(db, buffer_id)
+
+
+@router.post("/buffer/reject-batch", response_model=schemas.BufferBatchRejectOut)
+def reject_buffer_batch(body: schemas.BufferBatchRejectRequest,
+                        db: Session = Depends(database.get_db)):
+    """批量丢弃：把勾选的缓冲区条目一次置为 rejected（提升中的条目自动跳过）。"""
+    result = store.reject_buffer_many(db, body.ids)
+    return schemas.BufferBatchRejectOut(counts=store.buffer_stats(db), **result)
 
 
 @router.post("/buffer/{buffer_id}/summarize", response_model=schemas.BufferPaperOut)

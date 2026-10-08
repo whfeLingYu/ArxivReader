@@ -512,3 +512,105 @@ class SearchRun(Base):
             return data if isinstance(data, dict) else {}
         except (ValueError, TypeError):
             return {}
+
+
+# ---------------------------------------------------------------- 智能关联检索（Related Work）
+class RelatedRun(Base):
+    """一次「智能关联检索」的运行状态（前端轮询 /api/papers/{id}/related）。
+
+    stage ∈ {collect, extract, search, summarize, judge, done}；
+    status ∈ {running, done, cancelled, failed}（与检索 run 同口径，终态必须写 finished_at）。
+    """
+
+    __tablename__ = "related_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    paper_id: Mapped[int] = mapped_column(ForeignKey("papers.id"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    stage: Mapped[str] = mapped_column(String(16), nullable=False, default="collect")
+    log_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    counters_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    started_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=_utcnow)
+    finished_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
+
+    @property
+    def logs(self) -> List[dict]:
+        try:
+            data = json.loads(self.log_json or "[]")
+            return data if isinstance(data, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    @property
+    def counters(self) -> dict:
+        try:
+            data = json.loads(self.counters_json or "{}")
+            return data if isinstance(data, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+
+
+class RelatedCandidate(Base):
+    """关联检索命中的候选论文（源论文的 Related Work / References 里提到过的工作）。
+
+    同一 (source_paper_id, arxiv_id) 唯一：重复运行只更新不重复建行；
+    弱相关也保留（status=discarded）作为“已判定”记录，避免下次重复花 token。
+    relevance ∈ {"", strong, weak}；status ∈ {pending, discarded, promoted}。
+    """
+
+    __tablename__ = "related_candidates"
+    __table_args__ = (UniqueConstraint("source_paper_id", "arxiv_id",
+                                      name="uq_related_candidate"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[Optional[int]] = mapped_column(ForeignKey("related_runs.id"), nullable=True,
+                                                 index=True)
+    source_paper_id: Mapped[int] = mapped_column(ForeignKey("papers.id"), nullable=False,
+                                                index=True)
+    arxiv_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    abstract: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    authors_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    categories_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    published: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # 检索种子（命中的 References / Related Work 标题）与标题匹配度
+    seed_title: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
+    match_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # 轻量 summary 与相关性判定
+    summary_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    summary_stats_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    relevance: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    relevance_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    relevance_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    # 加入详细阅读的状态机：""/queued/running/done/failed
+    promote_state: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    promote_error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    promoted_paper_id: Mapped[Optional[int]] = mapped_column(ForeignKey("papers.id"),
+                                                            nullable=True, index=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=_utcnow,
+                                                         onupdate=_utcnow)
+
+    @property
+    def authors(self) -> List[str]:
+        try:
+            return json.loads(self.authors_json or "[]")
+        except (ValueError, TypeError):
+            return []
+
+    @property
+    def categories(self) -> List[str]:
+        try:
+            return json.loads(self.categories_json or "[]")
+        except (ValueError, TypeError):
+            return []
+
+    @property
+    def stats(self) -> dict:
+        try:
+            return json.loads(self.summary_stats_json or "{}")
+        except (ValueError, TypeError):
+            return {}

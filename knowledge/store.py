@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from app import config_loader
 from app.models import (BufferPaper, DirectionNode, Folder, NodeSynthesis, Paper,
                         PaperArtifact, PaperDirection, PaperRelation, PipelineRun,
-                        SearchRun)
+                        RelatedCandidate, RelatedRun, SearchRun)
 
 from . import graphdoc
 
@@ -730,6 +730,41 @@ def set_buffer_status(db: Session, row: BufferPaper, status: str) -> BufferPaper
     return row
 
 
+# 提升入库进行中的状态：批量丢弃要跳过，避免与后台线程竞态
+def reject_buffer_many(db: Session, ids: Sequence[int]) -> Dict[str, Any]:
+    """批量丢弃待读缓冲区条目（一次勾选多篇场景）。
+
+    只处理传入的 id：存在的记录置为 rejected；不存在的与提升中的 id 一律跳过。
+    返回 {rejected, rejected_ids, skipped_ids}。
+    """
+    wanted: List[int] = []
+    for value in ids or []:
+        try:
+            item = int(value)
+        except (TypeError, ValueError):
+            continue
+        if item not in wanted:
+            wanted.append(item)
+    rows = db.query(BufferPaper).filter(BufferPaper.id.in_(wanted)).all() if wanted else []
+    found = {row.id: row for row in rows}
+    rejected_ids: List[int] = []
+    skipped_ids: List[int] = [item for item in wanted if item not in found]
+    for item in wanted:
+        row = found.get(item)
+        if row is None:
+            continue
+        if row.promote_state in ("queued", "running"):
+            skipped_ids.append(row.id)
+            continue
+        row.status = BUFFER_REJECTED
+        row.updated_at = _utcnow()
+        rejected_ids.append(row.id)
+    if rejected_ids:
+        db.commit()
+    return {"rejected": len(rejected_ids), "rejected_ids": rejected_ids,
+            "skipped_ids": skipped_ids}
+
+
 def buffer_stats(db: Session) -> Dict[str, int]:
     counts = {BUFFER_PENDING: 0, BUFFER_READ: 0, BUFFER_REJECTED: 0}
     for status, total in (db.query(BufferPaper.status, func.count(BufferPaper.id))
@@ -754,19 +789,21 @@ def create_search_run(db: Session, request: Dict[str, Any]) -> SearchRun:
     return run
 
 
-def log_search(db: Session, run: SearchRun, message: str, *, level: str = "info",
-               arxiv_id: str = "") -> None:
-    logs = run.logs
+# 两类异步 run（SearchRun / RelatedRun）共享同一套日志与状态更新口径：
+# 字段同名（logs/stage/status/error/counters_json/finished_at），用鸭子类型泛化，避免逻辑漂移。
+def _append_run_log(db: Session, target: Any, message: str, *, level: str = "info",
+                    arxiv_id: str = "") -> None:
+    logs = target.logs
     logs.append({"ts": _utcnow().strftime("%H:%M:%S"), "level": level,
                  "message": str(message)[:400], "arxiv_id": arxiv_id})
-    run.log_json = json.dumps(logs[-SEARCH_LOG_TAIL:], ensure_ascii=False)
+    target.log_json = json.dumps(logs[-SEARCH_LOG_TAIL:], ensure_ascii=False)
     db.commit()
 
 
-def update_search_run(db: Session, run: SearchRun, *, stage: Optional[str] = None,
-                      status: Optional[str] = None, error: Optional[str] = None,
-                      counters: Optional[Dict[str, Any]] = None,
-                      finished: bool = False) -> SearchRun:
+def _update_run_record(db: Session, run: Any, *, stage: Optional[str] = None,
+                       status: Optional[str] = None, error: Optional[str] = None,
+                       counters: Optional[Dict[str, Any]] = None,
+                       finished: bool = False) -> Any:
     if stage:
         run.stage = stage
     if status:
@@ -781,6 +818,19 @@ def update_search_run(db: Session, run: SearchRun, *, stage: Optional[str] = Non
         run.finished_at = _utcnow()
     db.commit()
     return run
+
+
+def log_search(db: Session, run: SearchRun, message: str, *, level: str = "info",
+               arxiv_id: str = "") -> None:
+    _append_run_log(db, run, message, level=level, arxiv_id=arxiv_id)
+
+
+def update_search_run(db: Session, run: SearchRun, *, stage: Optional[str] = None,
+                      status: Optional[str] = None, error: Optional[str] = None,
+                      counters: Optional[Dict[str, Any]] = None,
+                      finished: bool = False) -> SearchRun:
+    return _update_run_record(db, run, stage=stage, status=status, error=error,
+                              counters=counters, finished=finished)
 
 
 def get_search_run(db: Session, run_id: int) -> Optional[SearchRun]:
@@ -801,3 +851,196 @@ def search_run_payload(run: SearchRun, *, log_tail: int = 80) -> Dict[str, Any]:
         "logs": run.logs[-max(1, int(log_tail)):],
         "log_total": len(run.logs),
     }
+
+
+# ---------------------------------------------------------------- 智能关联检索（Related Work）
+RELATED_PENDING = "pending"
+RELATED_DISCARDED = "discarded"
+RELATED_PROMOTED = "promoted"
+
+
+def create_related_run(db: Session, paper_id: int) -> RelatedRun:
+    run = RelatedRun(paper_id=int(paper_id), status="running", stage="collect",
+                     log_json="[]", counters_json="{}")
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def get_related_run(db: Session, run_id: int) -> Optional[RelatedRun]:
+    return db.get(RelatedRun, run_id)
+
+
+def latest_related_run(db: Session, paper_id: int) -> Optional[RelatedRun]:
+    return (db.query(RelatedRun).filter(RelatedRun.paper_id == int(paper_id))
+            .order_by(RelatedRun.id.desc()).first())
+
+
+def find_running_related_run(db: Session, paper_id: int) -> Optional[RelatedRun]:
+    return (db.query(RelatedRun)
+            .filter(RelatedRun.paper_id == int(paper_id), RelatedRun.status == "running")
+            .order_by(RelatedRun.id.desc()).first())
+
+
+def log_related(db: Session, run: RelatedRun, message: str, *, level: str = "info",
+                arxiv_id: str = "") -> None:
+    _append_run_log(db, run, message, level=level, arxiv_id=arxiv_id)
+
+
+def update_related_run(db: Session, run: RelatedRun, *, stage: Optional[str] = None,
+                       status: Optional[str] = None, error: Optional[str] = None,
+                       counters: Optional[Dict[str, Any]] = None,
+                       finished: bool = False) -> RelatedRun:
+    return _update_run_record(db, run, stage=stage, status=status, error=error,
+                              counters=counters, finished=finished)
+
+
+def related_run_payload(run: Optional[RelatedRun], *, log_tail: int = 80) -> Optional[Dict[str, Any]]:
+    if run is None:
+        return None
+    return {
+        "id": run.id, "paper_id": run.paper_id, "status": run.status, "stage": run.stage,
+        "counters": run.counters, "error": run.error,
+        "cancel_requested": bool(run.cancel_requested),
+        "started_at": _iso(run.started_at), "finished_at": _iso(run.finished_at),
+        "logs": run.logs[-max(1, int(log_tail)):],
+        "log_total": len(run.logs),
+    }
+
+
+def upsert_related_candidate(db: Session, *, source_paper_id: int, hit: Any, seed_title: str,
+                             run_id: Optional[int] = None) -> Tuple[RelatedCandidate, bool]:
+    """按 (source_paper_id, arxiv_id) 写入/更新候选；返回 (row, 是否新建)。
+
+    已判定（summary/verdict）的候选只刷新元信息与命中来源，不重置判定结果；
+    match_score 取历史与本次的较大值（多个种子命中同一篇时用最高分）。
+    """
+    data = hit.as_dict() if hasattr(hit, "as_dict") else dict(hit)
+    arxiv_id = str(data.get("arxiv_id") or "").strip()
+    row = (db.query(RelatedCandidate)
+           .filter(RelatedCandidate.source_paper_id == int(source_paper_id),
+                   RelatedCandidate.arxiv_id == arxiv_id).first())
+    created = row is None
+    if row is None:
+        row = RelatedCandidate(source_paper_id=int(source_paper_id), arxiv_id=arxiv_id,
+                               status=RELATED_PENDING)
+        db.add(row)
+    row.title = str(data.get("title") or "")[:1000]
+    row.abstract = str(data.get("abstract") or "")
+    row.authors_json = json.dumps(data.get("authors") or [], ensure_ascii=False)
+    row.categories_json = json.dumps(data.get("categories") or [], ensure_ascii=False)
+    row.published = data.get("published")
+    row.seed_title = str(seed_title or "")[:1024]
+    row.match_score = max(row.match_score or 0.0, float(data.get("match_score") or 0.0))
+    if run_id:
+        row.run_id = int(run_id)
+    row.updated_at = _utcnow()
+    db.commit()
+    db.refresh(row)
+    return row, created
+
+
+def get_related_candidate(db: Session, candidate_id: int) -> Optional[RelatedCandidate]:
+    return db.get(RelatedCandidate, candidate_id)
+
+
+def list_related_candidates(db: Session, source_paper_id: int, *,
+                            include_discarded: bool = False,
+                            limit: int = 200) -> List[RelatedCandidate]:
+    query = (db.query(RelatedCandidate)
+             .filter(RelatedCandidate.source_paper_id == int(source_paper_id)))
+    if not include_discarded:
+        query = query.filter(RelatedCandidate.status != RELATED_DISCARDED)
+    return (query.order_by(RelatedCandidate.relevance_score.desc(),
+                           RelatedCandidate.match_score.desc(),
+                           RelatedCandidate.id.desc())
+            .limit(max(1, int(limit))).all())
+
+
+def set_related_summary(db: Session, row: RelatedCandidate, *, summary_text: str,
+                        stats: Optional[Dict[str, Any]]) -> RelatedCandidate:
+    row.summary_text = summary_text or ""
+    row.summary_stats_json = json.dumps(stats or {}, ensure_ascii=False)
+    row.updated_at = _utcnow()
+    db.commit()
+    return row
+
+
+def set_related_verdict(db: Session, row: RelatedCandidate, *, relevance: str,
+                        score: float, reason: str) -> RelatedCandidate:
+    """写入强/弱相关判定：强相关保持 pending 等待用户决策，弱相关直接标 discarded。"""
+    row.relevance = "strong" if relevance == "strong" else "weak"
+    try:
+        row.relevance_score = max(0.0, min(1.0, float(score or 0.0)))
+    except (TypeError, ValueError):
+        row.relevance_score = 0.0
+    row.relevance_reason = (reason or "")[:2000]
+    row.status = RELATED_PENDING if row.relevance == "strong" else RELATED_DISCARDED
+    row.updated_at = _utcnow()
+    db.commit()
+    return row
+
+
+def discard_related_candidate(db: Session, row: RelatedCandidate) -> RelatedCandidate:
+    row.status = RELATED_DISCARDED
+    row.updated_at = _utcnow()
+    db.commit()
+    return row
+
+
+def delete_related_candidate(db: Session, row: RelatedCandidate) -> None:
+    db.delete(row)
+    db.commit()
+
+
+def related_counts(db: Session, source_paper_id: int) -> Dict[str, int]:
+    counts = {RELATED_PENDING: 0, RELATED_PROMOTED: 0, RELATED_DISCARDED: 0}
+    for status, total in (db.query(RelatedCandidate.status, func.count(RelatedCandidate.id))
+                          .filter(RelatedCandidate.source_paper_id == int(source_paper_id))
+                          .group_by(RelatedCandidate.status).all()):
+        counts[status] = int(total)
+    counts["strong"] = counts.get(RELATED_PENDING, 0) + counts.get(RELATED_PROMOTED, 0)
+    counts["total"] = sum(counts.get(k, 0)
+                          for k in (RELATED_PENDING, RELATED_PROMOTED, RELATED_DISCARDED))
+    return counts
+
+
+def _related_candidate_payload(row: RelatedCandidate, in_library: bool,
+                               in_buffer: bool) -> Dict[str, Any]:
+    return {
+        "id": row.id, "arxiv_id": row.arxiv_id, "title": row.title,
+        "abstract": row.abstract, "authors": row.authors, "categories": row.categories,
+        "published": row.published, "seed_title": row.seed_title,
+        "match_score": row.match_score, "summary_text": row.summary_text,
+        "relevance": row.relevance, "relevance_score": row.relevance_score,
+        "relevance_reason": row.relevance_reason, "status": row.status,
+        "promote_state": row.promote_state, "promote_error": row.promote_error,
+        "promoted_paper_id": row.promoted_paper_id,
+        "in_library": bool(in_library), "in_buffer": bool(in_buffer),
+        "created_at": _iso(row.created_at), "updated_at": _iso(row.updated_at),
+    }
+
+
+def related_candidates_payload(db: Session, source_paper_id: int, *,
+                               include_discarded: bool = False) -> List[Dict[str, Any]]:
+    """候选列表（默认只给强相关待处理/已入库的）+ 是否已在库/缓冲区的标志。"""
+    rows = list_related_candidates(db, source_paper_id, include_discarded=include_discarded)
+    arxiv_ids = [r.arxiv_id for r in rows]
+    in_library: set = set()
+    in_buffer: set = set()
+    if arxiv_ids:
+        in_library = {value[0] for value in
+                      db.query(Paper.arxiv_id).filter(Paper.arxiv_id.in_(arxiv_ids)).all()}
+        in_buffer = {value[0] for value in
+                     db.query(BufferPaper.arxiv_id)
+                     .filter(BufferPaper.arxiv_id.in_(arxiv_ids)).all()}
+    return [_related_candidate_payload(row, row.arxiv_id in in_library,
+                                       row.arxiv_id in in_buffer) for row in rows]
+
+
+def related_candidate_payload_single(db: Session, row: RelatedCandidate) -> Dict[str, Any]:
+    """单条候选 payload（前端轮询 promote 状态时用）。"""
+    in_library = db.query(Paper).filter(Paper.arxiv_id == row.arxiv_id).count() > 0
+    in_buffer = db.query(BufferPaper).filter(BufferPaper.arxiv_id == row.arxiv_id).count() > 0
+    return _related_candidate_payload(row, in_library, in_buffer)

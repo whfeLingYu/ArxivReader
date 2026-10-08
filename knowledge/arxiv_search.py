@@ -1,7 +1,9 @@
-"""ArXiv 批量检索（只取元信息，不下载全文）。
+"""ArXiv 检索（只取元信息，不下载全文）。
 
-用途：检索 Pipeline 的 Step 1。为了省带宽与时间，这里**只用 arXiv 官方 API 拉标题/摘要/作者/分类/日期**，
-绝不触发 PDF 下载；全文下载只发生在用户点“加入详细阅读”（迁入正式库）之后。
+两种入口：
+1) 批量检索（检索 Pipeline 的 Step 1）：分类/关键词/日期范围拼表达式，省带宽与时间；
+2) 标题检索 search_by_title（智能关联检索用）：把 Related Work / 参考文献里的
+   论文标题直接转成查询，命中后按标题相似度重排取“匹配度最高”的论文。
 
 检索条件（对齐前端表单）：
   categories  分类列表，多个分类取并集（cs.CL / cs.AI / cs.LG …）
@@ -11,7 +13,10 @@
 
 对外：
   build_query(...)      拼 arXiv 检索表达式（便于单测与调试）
-  search(...)           执行检索，返回 PaperMeta 列表（含 arxiv_id/title/abstract/…）
+  build_title_query(..) 按标题拼 ti: 表达式
+  title_similarity(..)  标题相似度（词集合 Jaccard）
+  search(...)           执行批量检索，返回 PaperMeta 列表（含 arxiv_id/title/abstract/…）
+  search_by_title(...)  按标题检索，返回按相似度降序的命中（match_score 已填）
 """
 
 import datetime
@@ -41,6 +46,7 @@ class SearchHit:
     published: Optional[str] = None
     updated: Optional[str] = None
     comment: str = ""
+    match_score: float = 0.0        # 标题检索时的相似度（批量检索为 0）
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -52,6 +58,7 @@ class SearchHit:
             "published": self.published,
             "updated": self.updated,
             "comment": self.comment,
+            "match_score": self.match_score,
         }
 
 
@@ -150,3 +157,78 @@ def search(categories: Sequence[str], keywords: Sequence[str], *,
     hits = [_to_hit(item) for item in client.results(search_req)]
     logger.info("arXiv 检索完成：%d 条", len(hits))
     return hits
+
+
+# ---------------------------------------------------------------- 标题检索（智能关联检索用）
+_TITLE_STOPWORDS = frozenset({
+    "a", "an", "the", "of", "for", "and", "or", "on", "in", "with", "to", "via",
+    "using", "towards", "toward", "from", "by", "at", "is", "are", "be", "as",
+    "into", "over", "under", "about", "all", "can", "do", "does", "how", "what",
+    "when", "new", "novel",
+})
+_TITLE_TERM_LIMIT = 12            # 拼查询用的最多检索词数（控制查询长度）
+_TITLE_SIMILARITY_FLOOR = 0.3     # 相似度低于此值的命中视为噪声
+
+
+def title_terms(title: str, limit: int = _TITLE_TERM_LIMIT) -> List[str]:
+    """标题 -> 检索词：去标点、去停用词、去重（保序），最多 limit 个。"""
+    cleaned = re.sub(r"[^A-Za-z0-9\-\s]", " ", str(title or ""))
+    terms: List[str] = []
+    for word in cleaned.split():
+        low = word.strip("-").lower()
+        if len(low) < 2 or low in _TITLE_STOPWORDS:
+            continue
+        if low not in terms:
+            terms.append(low)
+        if len(terms) >= max(1, int(limit)):
+            break
+    return terms
+
+
+def build_title_query(title: str, limit: int = _TITLE_TERM_LIMIT) -> str:
+    """按标题拼 ti: 查询（多词 AND）。
+
+    实测要点（与 abs: 同类）：带引号的短语 `ti:"..."` 会返回 0 条，
+    因此拆词后用 AND 组合，再配合本地标题相似度重排取“匹配度最高”的论文。
+    """
+    terms = title_terms(title, limit=limit)
+    if not terms:
+        return ""
+    return " AND ".join("ti:{}".format(t) for t in terms)
+
+
+def title_similarity(title_a: str, title_b: str) -> float:
+    """标题相似度（检索词集合的 Jaccard，0~1）：用于排序与过滤低质量命中。"""
+    set_a = set(title_terms(title_a, limit=40))
+    set_b = set(title_terms(title_b, limit=40))
+    if not set_a or not set_b:
+        return 0.0
+    union = len(set_a | set_b)
+    return len(set_a & set_b) / union if union else 0.0
+
+
+def search_by_title(title: str, *, max_results: int = 3,
+                    client: Optional[arxiv.Client] = None) -> List[SearchHit]:
+    """按论文标题检索 arXiv，返回按标题相似度降序的命中（hit.match_score 已填）。
+
+    策略：ti: 查询先多取一些（limit*3），再用本地相似度过滤排序取前 limit，
+    保证“匹配度最高”优先；网络/解析异常向上抛出，由调用方记入 run 日志。
+    """
+    query = build_title_query(title)
+    if not query:
+        logger.info("标题检索跳过（无有效检索词）：%s", str(title)[:120])
+        return []
+    limit = max(1, min(int(max_results or 3), 20))
+    logger.info("arXiv 标题检索：query=%s limit=%d", query, limit)
+    client = client or arxiv.Client(page_size=_API_PAGE_SIZE, delay_seconds=3.0, num_retries=3)
+    search_req = arxiv.Search(query=query, max_results=max(limit * 3, limit),
+                              sort_by=arxiv.SortCriterion.Relevance)
+    scored: List[SearchHit] = []
+    for item in client.results(search_req):
+        hit = _to_hit(item)
+        hit.match_score = round(title_similarity(title, hit.title), 4)
+        if hit.match_score >= _TITLE_SIMILARITY_FLOOR:
+            scored.append(hit)
+    scored.sort(key=lambda h: -h.match_score)
+    logger.info("标题检索完成：%d 条命中（相似度≥%.2f）", len(scored), _TITLE_SIMILARITY_FLOOR)
+    return scored[:limit]

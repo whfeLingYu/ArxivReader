@@ -11,7 +11,7 @@ import logging
 import os
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -173,6 +173,45 @@ def get_pdf(paper_id: int, db: Session = Depends(database.get_db)):
         filename=os.path.basename(paper.pdf_path),
         content_disposition_type="inline",
     )
+
+
+def _pdf_file_or_404(paper: Paper) -> str:
+    if not paper.pdf_path or not os.path.isfile(paper.pdf_path):
+        raise HTTPException(status_code=404, detail="PDF 文件不存在")
+    return paper.pdf_path
+
+
+@router.get("/{paper_id}/pages")
+def get_pdf_pages(paper_id: int, db: Session = Depends(database.get_db)):
+    """PDF 页面清单（页数 + 每页尺寸）：前端自绘查看器的布局占位与缩放基算。"""
+    paper = _get_paper_or_404(db, paper_id)
+    pdf_path = _pdf_file_or_404(paper)
+    try:
+        pages = pdf_service.page_geometry(pdf_path)
+    except Exception as exc:  # noqa: BLE001  损坏文件/渲染库异常
+        logger.warning("解析 PDF 页面失败（%s）：%s", pdf_path, str(exc)[:300])
+        raise HTTPException(status_code=502, detail="解析 PDF 失败：%s" % str(exc)[:200])
+    return {"paper_id": paper.id, "count": len(pages), "pages": pages}
+
+
+@router.get("/{paper_id}/page/{page_no}")
+def get_pdf_page_image(paper_id: int, page_no: int,
+                       scale: float = Query(pdf_service.DEFAULT_RENDER_SCALE, ge=0.5, le=4.0,
+                                            description="渲染倍率（2 约合 144 DPI）"),
+                       db: Session = Depends(database.get_db)):
+    """单页渲染为 PNG：前端查看器据此实现滚轮/触控板缩放（服务端 PyMuPDF，零前端依赖）。"""
+    paper = _get_paper_or_404(db, paper_id)
+    pdf_path = _pdf_file_or_404(paper)
+    try:
+        png = pdf_service.render_page_png(pdf_path, page_no, scale)
+    except IndexError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("渲染 PDF 页面失败（%s p%s）：%s", pdf_path, page_no, str(exc)[:300])
+        raise HTTPException(status_code=502, detail="渲染页面失败：%s" % str(exc)[:200])
+    # 同一页同一倍率的内容不会变化：允许浏览器私有缓存，滚动翻页不重复渲染
+    return Response(content=png, media_type="image/png",
+                    headers={"Cache-Control": "private, max-age=3600"})
 
 
 @router.get("/{paper_id}/text")

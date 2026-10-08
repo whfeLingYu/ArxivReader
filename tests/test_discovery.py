@@ -449,6 +449,43 @@ def test_api_buffer_promote_and_summarize(client, monkeypatch):
     assert summarized["summary_text"] == "TL;DR: y" and summarized["verified_path"] == "LLM/RL"
 
 
+# ---------------------------------------------------------------- 批量丢弃
+def test_reject_buffer_many_skips_missing_and_promoting(db):
+    r1 = store.upsert_buffer_paper(db, _hit("2609.60001", "Batch A"), match_score=0.5)
+    r2 = store.upsert_buffer_paper(db, _hit("2609.60002", "Batch B"), match_score=0.5)
+    r2.promote_state = "queued"
+    db.commit()
+    result = store.reject_buffer_many(db, [r1.id, r2.id, 424242, r1.id])
+    assert result["rejected"] == 1 and result["rejected_ids"] == [r1.id]
+    assert set(result["skipped_ids"]) == {r2.id, 424242}      # 提升中的与不存在的都跳过
+    db.refresh(r1)
+    assert r1.status == store.BUFFER_REJECTED
+    assert store.buffer_stats(db)[store.BUFFER_REJECTED] == 1
+
+
+def test_api_buffer_batch_reject(client):
+    _, buffer_id = _seed_run_and_buffer(client)
+    db = database.SessionLocal()
+    try:
+        id2 = store.upsert_buffer_paper(db, _hit("2609.60002", "Batch B"), match_score=0.5).id
+        row3 = store.upsert_buffer_paper(db, _hit("2609.60003", "Batch C"), match_score=0.4)
+        row3.promote_state = "running"
+        db.commit()
+        id3 = row3.id
+    finally:
+        db.close()
+
+    r = client.post("/api/buffer/reject-batch", json={"ids": [buffer_id, id2, id3, 999999]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["rejected"] == 2
+    assert id3 in body["skipped_ids"] and 999999 in body["skipped_ids"]
+    assert body["counts"]["pending"] == 1                    # 只剩提升中的那条
+    assert {item["id"] for item in client.get("/api/buffer").json()["items"]} == {id3}
+    # 空 ids 被 schema 拦下
+    assert client.post("/api/buffer/reject-batch", json={"ids": []}).status_code == 422
+
+
 def test_api_knowledge_graph_md_endpoint(client):
     db = database.SessionLocal()
     try:
